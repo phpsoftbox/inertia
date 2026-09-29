@@ -20,7 +20,7 @@ use RuntimeException;
 
 use function array_diff_key;
 use function array_intersect_key;
-use function array_replace_recursive;
+use function array_is_list;
 use function explode;
 use function is_array;
 use function json_encode;
@@ -32,15 +32,27 @@ use const JSON_UNESCAPED_SLASHES;
 final class Inertia
 {
     /**
+     * Базовые shared-данные уровня приложения (из InertiaConfig), не меняются между запросами.
+     *
      * @var array<string, mixed>
      */
-    private array $shared;
+    private readonly array $baseShared;
     /**
-     * @var array<int, callable(): array<string, mixed>>
+     * Shared-данные текущего запроса (share()/shareMany()), сбрасываются в setRequest()/reset().
+     *
+     * @var array<string, mixed>
+     */
+    private array $shared = [];
+    /**
+     * Persistent-провайдеры уровня приложения: ключ провайдера => провайдер.
+     *
+     * @var array<string|int, callable(): array<string, mixed>>
      */
     private array $sharedProviders = [];
     /**
-     * @var array<int, callable(): array<string, mixed>>
+     * Провайдеры текущего запроса, сбрасываются в setRequest()/reset().
+     *
+     * @var array<string|int, callable(): array<string, mixed>>
      */
     private array $requestSharedProviders    = [];
     private ?ServerRequestInterface $request = null;
@@ -58,37 +70,51 @@ final class Inertia
         ?AreaSharedDataProviderRegistry $areaSharedDataProviders = null,
         private readonly ?PayloadNormalizerInterface $payloadNormalizer = null,
     ) {
-        $this->shared                  = $config->shared();
+        $this->baseShared              = $config->shared();
         $this->request                 = $request;
         $this->areaDetector            = $areaDetector ?? $this->createConfiguredAreaDetector($config);
         $this->areaSharedDataProviders = $areaSharedDataProviders ?? new AreaSharedDataProviderRegistry();
     }
 
+    /**
+     * Добавляет shared-prop текущего запроса. Значение сбрасывается в setRequest() и reset(),
+     * поэтому не попадает в следующий запрос worker'а. Данные уровня приложения задавайте
+     * через `InertiaConfig::$shared` или persistent-провайдер.
+     */
     public function share(string $key, mixed $value): void
     {
         $this->shared[$key] = $value;
     }
 
     /**
+     * Добавляет несколько shared-props текущего запроса (сбрасываются в setRequest() и reset()).
+     *
      * @param array<string, mixed> $props
      */
     public function shareMany(array $props): void
     {
-        $this->shared = array_replace_recursive($this->shared, $props);
+        $this->shared = self::mergeProps($this->shared, $props);
     }
 
     /**
+     * Регистрирует ленивый провайдер shared-данных.
+     *
+     * По умолчанию провайдер относится к текущему запросу и сбрасывается в setRequest()/reset().
+     * Persistent-провайдер (`persistent: true`) живёт весь срок жизни сервиса — регистрируйте его
+     * только при сборке приложения. Повторная регистрация того же callable игнорируется, а провайдер
+     * с тем же `$key` заменяет ранее зарегистрированный — список провайдеров не растёт от запроса к запросу.
+     *
      * @param callable(): array<string, mixed> $provider
      */
-    public function shareProvider(callable $provider, bool $persistent = true): void
+    public function shareProvider(callable $provider, bool $persistent = false, ?string $key = null): void
     {
         if ($persistent) {
-            $this->sharedProviders[] = $provider;
+            $this->sharedProviders = self::addProvider($this->sharedProviders, $provider, $key);
 
             return;
         }
 
-        $this->requestSharedProviders[] = $provider;
+        $this->requestSharedProviders = self::addProvider($this->requestSharedProviders, $provider, $key);
     }
 
     /**
@@ -101,7 +127,7 @@ final class Inertia
 
         $page = new InertiaPage(
             component: $component,
-            props: $this->mergeProps($props, $request, $area, $component),
+            props: $this->buildProps($props, $request, $area, $component),
             url: $this->resolveUrl($request),
             version: $this->config->version(),
         );
@@ -131,9 +157,26 @@ final class Inertia
         return $response->withBody($this->streamFactory->createStream($payload));
     }
 
+    /**
+     * Начинает новый запрос: сбрасывает данные предыдущего запроса (см. reset()) и запоминает текущий.
+     */
     public function setRequest(ServerRequestInterface $request): void
     {
-        $this->request                = $request;
+        $this->reset();
+        $this->request = $request;
+    }
+
+    /**
+     * Сбрасывает состояние запроса: текущий request, shared-данные из share()/shareMany() и
+     * request-scoped провайдеры. Базовые shared-данные из конфига и persistent-провайдеры сохраняются.
+     *
+     * Вызывается на границе запроса в долгоживущих worker'ах (например, через ServicesResetter
+     * с маппингом `Inertia::class => 'reset'`).
+     */
+    public function reset(): void
+    {
+        $this->request                = null;
+        $this->shared                 = [];
         $this->requestSharedProviders = [];
     }
 
@@ -141,10 +184,10 @@ final class Inertia
      * @param array<string, mixed> $props
      * @return array<string, mixed>
      */
-    private function mergeProps(array $props, ServerRequestInterface $request, ?InertiaArea $area, string $component): array
+    private function buildProps(array $props, ServerRequestInterface $request, ?InertiaArea $area, string $component): array
     {
         $shared = $this->resolveShared($request, $area);
-        $props  = array_replace_recursive($shared, $props);
+        $props  = self::mergeProps($shared, $props);
         $props  = $this->filterPartialProps($component, $props, $request);
         $props  = $this->resolveProps($props);
 
@@ -160,34 +203,90 @@ final class Inertia
      */
     private function resolveShared(ServerRequestInterface $request, ?InertiaArea $area): array
     {
-        $shared = $this->shared;
+        // Данные share()/shareMany() накладываются на базовые данные конфига, провайдеры применяются позже.
+        $shared = self::mergeProps($this->baseShared, $this->shared);
 
         if ($area !== null && $area->config()->shared() !== []) {
-            $shared = array_replace_recursive($shared, $area->config()->shared());
+            $shared = self::mergeProps($shared, $area->config()->shared());
         }
 
         foreach ($this->sharedProviders as $provider) {
             $provided = $provider();
             if ($provided !== []) {
-                $shared = array_replace_recursive($shared, $provided);
+                $shared = self::mergeProps($shared, $provided);
             }
         }
 
         foreach ($this->requestSharedProviders as $provider) {
             $provided = $provider();
             if ($provided !== []) {
-                $shared = array_replace_recursive($shared, $provided);
+                $shared = self::mergeProps($shared, $provided);
             }
         }
 
         if ($area !== null) {
             $provided = $this->areaSharedDataProviders->share($area->name(), $request);
             if ($provided !== []) {
-                $shared = array_replace_recursive($shared, $provided);
+                $shared = self::mergeProps($shared, $provided);
             }
         }
 
         return $shared;
+    }
+
+    /**
+     * Рекурсивно сливает props: ассоциативные массивы объединяются по ключам, а списки
+     * (и скаляры) из `$override` целиком заменяют значение из `$base` — без слияния по индексам.
+     *
+     * @param array<array-key, mixed> $base
+     * @param array<array-key, mixed> $override
+     * @return array<array-key, mixed>
+     */
+    private static function mergeProps(array $base, array $override): array
+    {
+        foreach ($override as $key => $value) {
+            $current = $base[$key] ?? null;
+
+            if (
+                is_array($value)
+                && is_array($current)
+                && !array_is_list($value)
+                && !array_is_list($current)
+            ) {
+                $base[$key] = self::mergeProps($current, $value);
+
+                continue;
+            }
+
+            $base[$key] = $value;
+        }
+
+        return $base;
+    }
+
+    /**
+     * @param array<string|int, callable(): array<string, mixed>> $providers
+     * @param callable(): array<string, mixed> $provider
+     * @return array<string|int, callable(): array<string, mixed>>
+     */
+    private static function addProvider(array $providers, callable $provider, ?string $key): array
+    {
+        if ($key !== null) {
+            // Префикс исключает смешение с автоматическими числовыми ключами.
+            $providers['key:' . $key] = $provider;
+
+            return $providers;
+        }
+
+        foreach ($providers as $registered) {
+            if ($registered === $provider) {
+                return $providers;
+            }
+        }
+
+        $providers[] = $provider;
+
+        return $providers;
     }
 
     private function ssrEnabled(?InertiaArea $area): bool

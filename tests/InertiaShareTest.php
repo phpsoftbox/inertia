@@ -16,8 +16,8 @@ use PhpSoftBox\Inertia\Page\Tabs;
 use PhpSoftBox\Inertia\Share\InertiaBaseDataProvider;
 use PhpSoftBox\Inertia\Share\SharedDataProviderInterface;
 use PhpSoftBox\Inertia\View\ViewRendererInterface;
-use PhpSoftBox\Session\ArraySessionStore;
 use PhpSoftBox\Session\Session;
+use PhpSoftBox\Session\Store\ArraySessionStore;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversMethod;
 use PHPUnit\Framework\Attributes\Test;
@@ -133,7 +133,7 @@ final class InertiaShareTest extends TestCase
         $value = 'initial';
         $inertia->shareProvider(static function () use (&$value): array {
             return ['meta' => ['value' => $value]];
-        });
+        }, persistent: true);
         $value = 'final';
 
         $request = new ServerRequest('GET', 'https://example.test/admin', [

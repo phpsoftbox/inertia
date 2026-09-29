@@ -6,6 +6,7 @@ namespace PhpSoftBox\Inertia\Ssr;
 
 use PhpSoftBox\Inertia\InertiaPage;
 use Psr\Http\Message\ServerRequestInterface;
+use RuntimeException;
 use Throwable;
 
 use function array_values;
@@ -50,7 +51,7 @@ final class HttpSsrRenderer implements SsrRendererInterface
         }
 
         if (!is_array($response)) {
-            return null;
+            return $this->fail('Inertia SSR server returned no response: ' . $url);
         }
 
         $head = [];
@@ -64,9 +65,21 @@ final class HttpSsrRenderer implements SsrRendererInterface
 
         $body = is_string($response['body'] ?? null) ? (string) $response['body'] : '';
         if ($head === [] && $body === '') {
-            return null;
+            return $this->fail('Inertia SSR server returned an empty page: ' . $url);
         }
 
         return new SsrResponse(array_values($head), $body);
+    }
+
+    /**
+     * Fail-open режим возвращает null (Inertia отдаст HTML shell без SSR), строгий — бросает исключение.
+     */
+    private function fail(string $message): null
+    {
+        if ($this->failSilently) {
+            return null;
+        }
+
+        throw new RuntimeException($message);
     }
 }
