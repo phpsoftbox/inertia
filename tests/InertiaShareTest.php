@@ -133,7 +133,7 @@ final class InertiaShareTest extends TestCase
         $value = 'initial';
         $inertia->shareProvider(static function () use (&$value): array {
             return ['meta' => ['value' => $value]];
-        });
+        }, persistent: true);
         $value = 'final';
 
         $request = new ServerRequest('GET', 'https://example.test/admin', [

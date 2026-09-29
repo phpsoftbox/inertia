@@ -8,6 +8,7 @@ use PhpSoftBox\Http\Message\ServerRequest;
 use PhpSoftBox\Inertia\InertiaPage;
 use PhpSoftBox\Inertia\Ssr\HttpSsrRenderer;
 use PhpSoftBox\Inertia\Ssr\HttpSsrTransportInterface;
+use PhpSoftBox\Inertia\Ssr\NativeHttpSsrTransport;
 use PhpSoftBox\Inertia\Ssr\SsrResponse;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversMethod;
@@ -17,9 +18,11 @@ use RuntimeException;
 
 #[CoversClass(HttpSsrRenderer::class)]
 #[CoversClass(SsrResponse::class)]
+#[CoversClass(NativeHttpSsrTransport::class)]
 #[CoversMethod(HttpSsrRenderer::class, 'render')]
 #[CoversMethod(SsrResponse::class, 'head')]
 #[CoversMethod(SsrResponse::class, 'body')]
+#[CoversMethod(NativeHttpSsrTransport::class, 'postJson')]
 final class HttpSsrRendererTest extends TestCase
 {
     /**
@@ -90,5 +93,100 @@ final class HttpSsrRendererTest extends TestCase
         );
 
         $this->assertNull($response);
+    }
+
+    /**
+     * Проверим, что в строгом режиме ошибка transport пробрасывается.
+     *
+     * @see HttpSsrRenderer::render()
+     */
+    #[Test]
+    public function strictModeRethrowsTransportException(): void
+    {
+        $transport = new class () implements HttpSsrTransportInterface {
+            public function postJson(string $url, array $payload, float $timeout, array $headers = []): ?array
+            {
+                throw new RuntimeException('SSR server is unavailable.');
+            }
+        };
+
+        $renderer = new HttpSsrRenderer(
+            url: 'http://node:13714/render',
+            failSilently: false,
+            transport: $transport,
+        );
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('SSR server is unavailable.');
+
+        $renderer->render(new ServerRequest('GET', 'https://example.test/'), new InertiaPage('Home', [], '/'));
+    }
+
+    /**
+     * Проверим, что в строгом режиме пустой ответ transport (null) приводит к исключению.
+     *
+     * @see HttpSsrRenderer::render()
+     */
+    #[Test]
+    public function strictModeThrowsWhenTransportReturnsNull(): void
+    {
+        $transport = new class () implements HttpSsrTransportInterface {
+            public function postJson(string $url, array $payload, float $timeout, array $headers = []): ?array
+            {
+                return null;
+            }
+        };
+
+        $renderer = new HttpSsrRenderer(
+            url: 'http://node:13714/render',
+            failSilently: false,
+            transport: $transport,
+        );
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Inertia SSR server returned no response');
+
+        $renderer->render(new ServerRequest('GET', 'https://example.test/'), new InertiaPage('Home', [], '/'));
+    }
+
+    /**
+     * Проверим, что в строгом режиме недоступный SSR-сервер (встроенный transport) приводит к исключению.
+     *
+     * @see HttpSsrRenderer::render()
+     * @see NativeHttpSsrTransport::postJson()
+     */
+    #[Test]
+    public function strictModeThrowsWhenServerIsUnavailable(): void
+    {
+        // Порт 1 на localhost закрыт: соединение отклоняется сразу.
+        $renderer = new HttpSsrRenderer(
+            url: 'http://127.0.0.1:1/render',
+            timeout: 1.0,
+            failSilently: false,
+        );
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Inertia SSR server is unavailable');
+
+        $renderer->render(new ServerRequest('GET', 'https://example.test/'), new InertiaPage('Home', [], '/'));
+    }
+
+    /**
+     * Проверим, что в fail-open режиме недоступный SSR-сервер даёт null.
+     *
+     * @see HttpSsrRenderer::render()
+     * @see NativeHttpSsrTransport::postJson()
+     */
+    #[Test]
+    public function failOpenModeReturnsNullWhenServerIsUnavailable(): void
+    {
+        $renderer = new HttpSsrRenderer(
+            url: 'http://127.0.0.1:1/render',
+            timeout: 1.0,
+        );
+
+        $response = $renderer->render(new ServerRequest('GET', 'https://example.test/'), new InertiaPage('Home', [], '/'));
+
+        self::assertNull($response);
     }
 }
